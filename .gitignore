@@ -4,3 +4,5 @@ __pycache__/
 .DS_Store
 explore.py
 dias_primaverales_retiro.png
+# Parquet legacy de Retiro (migrado a data/3195.parquet)
+/retiro_raw.parquet

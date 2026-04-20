@@ -34,11 +34,47 @@ import matplotlib.colors as mcolors
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-OUT_DIR = Path(__file__).parent
-RAW = OUT_DIR / "retiro_raw.parquet"
-OUT_FULL = OUT_DIR / "heatmap_primaverales.png"
-OUT_ONLY = OUT_DIR / "heatmap_solo_primaverales.png"
-OUT_BARS = OUT_DIR / "barras_primaverales.png"
+ROOT = Path(__file__).parent
+DATA_DIR = ROOT / "data"
+CHARTS_DIR = ROOT / "charts"
+CHARTS_DIR.mkdir(exist_ok=True)
+
+# Nombres por defecto (estación 3195 Retiro) se mantienen en raíz para compat.
+LEGACY_STATION = "3195"
+LEGACY_OUT_FULL = ROOT / "heatmap_primaverales.png"
+LEGACY_OUT_ONLY = ROOT / "heatmap_solo_primaverales.png"
+LEGACY_OUT_BARS = ROOT / "barras_primaverales.png"
+
+STATION_NAMES = {
+    "3195": "Madrid Retiro",
+    "3129": "Madrid Barajas",
+    "0076": "Barcelona El Prat",
+    "5783": "Sevilla Aeropuerto",
+    "1024E": "Bilbao Aeropuerto",
+    "8414A": "Valencia Aeropuerto",
+    "6155A": "Málaga Aeropuerto",
+}
+
+
+def raw_parquet_for(station: str) -> Path:
+    cand = DATA_DIR / f"{station}.parquet"
+    if cand.exists():
+        return cand
+    # Backward compat: antiguo retiro_raw.parquet en raíz
+    legacy = ROOT / "retiro_raw.parquet"
+    if station == LEGACY_STATION and legacy.exists():
+        return legacy
+    raise FileNotFoundError(f"No hay parquet para la estación {station} ({cand})")
+
+
+def outputs_for(station: str) -> tuple[Path, Path, Path]:
+    if station == LEGACY_STATION:
+        return LEGACY_OUT_FULL, LEGACY_OUT_ONLY, LEGACY_OUT_BARS
+    return (
+        CHARTS_DIR / f"{station}_heatmap.png",
+        CHARTS_DIR / f"{station}_solo_entretiempo.png",
+        CHARTS_DIR / f"{station}_barras.png",
+    )
 
 CATS = [
     ("Sin datos",   "#eeeeee", "",   ""),
@@ -71,13 +107,13 @@ END
 """
 
 
-def load_grid():
+def load_grid(parquet: Path):
     con = duckdb.connect()
     rows = con.execute(f"""
         SELECT EXTRACT(YEAR FROM fecha)::INT AS anio,
                EXTRACT(DOY  FROM fecha)::INT AS doy,
                {CLASSIFY_SQL} AS cat
-        FROM '{RAW}'
+        FROM '{parquet}'
         ORDER BY anio, doy
     """).fetchall()
     years = sorted({r[0] for r in rows})
@@ -89,13 +125,13 @@ def load_grid():
     return grid, years
 
 
-def load_median_temp() -> dict[int, float]:
+def load_median_temp(parquet: Path) -> dict[int, float]:
     """Temperatura media anual mediana: median(tmax+tmin)/2 por año."""
     con = duckdb.connect()
     rows = con.execute(f"""
         SELECT EXTRACT(YEAR FROM fecha)::INT AS anio,
                MEDIAN((tmax + tmin) / 2.0) AS tmed
-        FROM '{RAW}'
+        FROM '{parquet}'
         WHERE tmax IS NOT NULL AND tmin IS NOT NULL
         GROUP BY anio
         ORDER BY anio
@@ -214,7 +250,8 @@ def compose(heatmap: Image.Image, cats: list, path: Path, scale: float = 1.6) ->
     print(f"PNG → {path}")
 
 
-def render_bars(grid: np.ndarray, years: list[int], start_year: int = 1975) -> None:
+def render_bars(grid: np.ndarray, years: list[int], parquet: Path,
+                 out_path: Path, station_name: str, start_year: int = 1975) -> None:
     """Bar chart: días de entretiempo por año, coloreado por temperatura mediana anual."""
     ent_per_year = (grid == ENT_IDX).sum(axis=1)
     obs_per_year = (grid > 0).sum(axis=1)
@@ -224,7 +261,7 @@ def render_bars(grid: np.ndarray, years: list[int], start_year: int = 1975) -> N
     ent_f = ent_per_year[mask]
     obs_f = obs_per_year[mask]
 
-    med_temp = load_median_temp()
+    med_temp = load_median_temp(parquet)
     temps_f = np.array([med_temp.get(int(y), np.nan) for y in years_f])
 
     window = 5
@@ -266,7 +303,7 @@ def render_bars(grid: np.ndarray, years: list[int], start_year: int = 1975) -> N
         )
 
     ax.set_title(
-        f"Días de entretiempo por año en Madrid Retiro · {years_f.min()}-{years_f.max()} "
+        f"Días de entretiempo por año en {station_name} · {years_f.min()}-{years_f.max()} "
         "(20°C ≤ Tmax ≤ 27°C · Tmin ≥ 10°C)",
         fontsize=16, fontweight="bold", pad=14,
     )
@@ -296,14 +333,16 @@ def render_bars(grid: np.ndarray, years: list[int], start_year: int = 1975) -> N
     cbar.set_label("Temperatura mediana anual (°C)", fontsize=11)
     cbar.ax.tick_params(labelsize=10)
 
-    plt.savefig(OUT_BARS, dpi=150, bbox_inches="tight", pad_inches=0.8,
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", pad_inches=0.8,
                 facecolor="white")
     plt.close(fig)
-    print(f"PNG → {OUT_BARS}")
+    print(f"PNG → {out_path}")
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--station", default="3195",
+                    help="Indicativo AEMET (default: 3195 Madrid Retiro)")
     ap.add_argument("--only-entretiempo", "--only-primaveral", dest="only_ent",
                     action="store_true", help="Solo heatmap de días de entretiempo")
     ap.add_argument("--full", action="store_true", help="Solo heatmap completo")
@@ -314,23 +353,27 @@ def main():
     do_only = args.only_ent or not (args.full or args.bars)
     do_bars = args.bars or not (args.full or args.only_ent)
 
-    grid, years = load_grid()
+    parquet = raw_parquet_for(args.station)
+    out_full, out_only, out_bars = outputs_for(args.station)
+    station_name = STATION_NAMES.get(args.station, f"estación {args.station}")
+
+    grid, years = load_grid(parquet)
 
     if do_full:
         hm = render_heatmap(grid, years,
-                            title="Clima diario en Madrid Retiro (estación AEMET 3195)",
+                            title=f"Clima diario en {station_name} (AEMET {args.station})",
                             only_ent=False)
-        compose(hm, CATS, OUT_FULL)
+        compose(hm, CATS, out_full)
 
     if do_only:
         hm = render_heatmap(grid, years,
-                            title="Días de entretiempo en Madrid Retiro (20°C ≤ Tmax ≤ 27°C · Tmin ≥ 10°C)",
+                            title=f"Días de entretiempo en {station_name} (20°C ≤ Tmax ≤ 27°C · Tmin ≥ 10°C)",
                             only_ent=True)
         ent_cats = [CATS[ENT_IDX], ("Otros días", "#f2f2f2", "", "Resto del año")]
-        compose(hm, ent_cats, OUT_ONLY)
+        compose(hm, ent_cats, out_only)
 
     if do_bars:
-        render_bars(grid, years)
+        render_bars(grid, years, parquet, out_bars, station_name)
 
 
 if __name__ == "__main__":
