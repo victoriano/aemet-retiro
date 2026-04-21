@@ -256,7 +256,7 @@ def render_bars(grid: np.ndarray, years: list[int], parquet: Path,
     ent_per_year = (grid == ENT_IDX).sum(axis=1)
     obs_per_year = (grid > 0).sum(axis=1)
     years_arr = np.array(years)
-    mask = (obs_per_year >= 300) & (years_arr >= start_year)
+    mask = (obs_per_year >= 50) & (years_arr >= start_year)
     years_f = years_arr[mask]
     ent_f = ent_per_year[mask]
     obs_f = obs_per_year[mask]
